@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# CVE-2026-98432 mitigation (Ubuntu / Debian)
-#  - drop incoming TCP packets with IPv4 options (nftables, prerouting/raw)
-#  - net.ipv4.tcp_migrate_req=0
+# CVE-2026-98432 mitigation
+#   Ubuntu / Debian / RHEL-family (incl. CentOS 7)
+#   - drop incoming TCP packets with IPv4 options (prerouting, before conntrack)
+#       backend nft       : nftables table inet cve98432 (systemd unit)
+#       backend iptables  : iptables raw PREROUTING u32 rule (systemd unit)
+#       backend firewalld : same iptables rule as a permanent firewalld direct rule
+#   - net.ipv4.tcp_migrate_req=0 (if the kernel has it)
 # Usage:
 #   bash cve98432.sh            # apply + verify
 #   bash cve98432.sh --check    # verify only
@@ -9,25 +13,75 @@
 set -u
 UNIT=/etc/systemd/system/cve98432.service
 RULES=/etc/cve98432.nft
+HELPER=/usr/local/sbin/cve98432-iptables
 SYSCTL=/etc/sysctl.d/99-cve98432.conf
+STATE=/etc/cve98432.backend
 MIG=/proc/sys/net/ipv4/tcp_migrate_req
+U32='0>>24&0x0F=6:15'                       # IPv4 IHL 6..15 = header has options
+IPT_ARGS=(-p tcp -m u32 --u32 "$U32" -j DROP)
 H=$(hostname)
 R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; N=$'\e[0m'
 FAILED=0
 ok()   { echo "${G}[OK]${N}   $*"; }
 warn() { echo "${Y}[WARN]${N} $*"; }
 fail() { echo "${R}[FAIL]${N} $*"; FAILED=1; }
+have() { command -v "$1" >/dev/null 2>&1; }
 
 [ "$(id -u)" -eq 0 ] || { echo "Run as root"; exit 2; }
 MODE=${1:-apply}
 
+fw_active()   { have firewall-cmd && systemctl is-active firewalld </dev/null >/dev/null 2>&1; }
+nft_present() { have nft && nft list table inet cve98432 </dev/null >/dev/null 2>&1; }
+ipt_present() { have iptables && iptables -t raw -S 2>/dev/null | grep -Eq 'u32.*(0x6:0xf|6:15)'; }
+
+detect_backend() {
+  if [ -s "$STATE" ]; then cat "$STATE"; return; fi
+  if nft_present; then echo nft; return; fi
+  if ipt_present; then fw_active && echo firewalld || echo iptables; return; fi
+  echo none
+}
+
+write_unit() {   # $1 = ExecStart, $2 = ExecStop, $3 = optional ExecStartPre
+  cat > "$UNIT" <<EOF
+[Unit]
+Description=Mitigation CVE-2026-98432 (drop TCP with IPv4 options)
+After=network-pre.target nftables.service iptables.service firewalld.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+${3:+ExecStartPre=$3}
+ExecStart=$1
+ExecStop=$2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload </dev/null
+  systemctl enable cve98432 </dev/null >/dev/null 2>&1
+  systemctl restart cve98432 </dev/null
+}
+
+remove_all() {
+  systemctl disable --now cve98432 </dev/null >/dev/null 2>&1
+  have nft && nft delete table inet cve98432 </dev/null >/dev/null 2>&1
+  if fw_active; then
+    firewall-cmd --permanent --direct --remove-rule ipv4 raw PREROUTING 0 "${IPT_ARGS[@]}" >/dev/null 2>&1
+    firewall-cmd --reload >/dev/null 2>&1
+  fi
+  if have iptables; then
+    while iptables -t raw -D PREROUTING "${IPT_ARGS[@]}" 2>/dev/null; do :; done
+  fi
+  rm -f "$UNIT" "$RULES" "$HELPER" "$SYSCTL" "$STATE"
+  systemctl daemon-reload </dev/null
+}
+
 # ---------- remove ----------
 if [ "$MODE" = "--remove" ]; then
-  systemctl disable --now cve98432 </dev/null >/dev/null 2>&1
-  rm -f "$UNIT" "$SYSCTL" "$RULES"
-  systemctl daemon-reload </dev/null
-  if nft list table inet cve98432 </dev/null >/dev/null 2>&1; then
-    fail "$H: table inet cve98432 still present"
+  remove_all
+  if nft_present || ipt_present; then
+    fail "$H: rule still present"
   else
     ok "$H: mitigation removed"
   fi
@@ -35,15 +89,8 @@ if [ "$MODE" = "--remove" ]; then
 fi
 
 # ---------- apply ----------
-if [ "$MODE" = "apply" ]; then
-  if ! command -v nft >/dev/null 2>&1; then
-    echo "Installing nftables..."
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq </dev/null >/dev/null 2>&1
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables </dev/null >/dev/null 2>&1
-  fi
-  NFT=$(command -v nft) || { fail "$H: nft not available"; exit 1; }
-
-  # rules in a file: avoids CLI parsing issues on old nft (0.9.x treats "-300" as an option)
+apply_nft() {
+  NFT=$(command -v nft)
   cat > "$RULES" <<'EOF'
 table inet cve98432 {
   chain pre {
@@ -52,25 +99,59 @@ table inet cve98432 {
   }
 }
 EOF
-  cat > "$UNIT" <<EOF
-[Unit]
-Description=Mitigation CVE-2026-98432 (drop TCP with IPv4 options)
-After=network-pre.target nftables.service
-Wants=network-pre.target
+  write_unit "$NFT -f $RULES" "-$NFT delete table inet cve98432" "-$NFT delete table inet cve98432"
+  nft_present
+}
 
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStartPre=-$NFT delete table inet cve98432
-ExecStart=$NFT -f $RULES
-ExecStop=-$NFT delete table inet cve98432
-
-[Install]
-WantedBy=multi-user.target
+apply_iptables() {
+  IPT=$(command -v iptables)
+  cat > "$HELPER" <<EOF
+#!/bin/sh
+# CVE-2026-98432 mitigation helper
+case "\$1" in
+  start) $IPT -t raw -C PREROUTING -p tcp -m u32 --u32 '$U32' -j DROP 2>/dev/null || \\
+         $IPT -t raw -I PREROUTING -p tcp -m u32 --u32 '$U32' -j DROP ;;
+  stop)  while $IPT -t raw -D PREROUTING -p tcp -m u32 --u32 '$U32' -j DROP 2>/dev/null; do :; done ;;
+esac
 EOF
-  systemctl daemon-reload </dev/null
-  systemctl enable cve98432 </dev/null >/dev/null 2>&1
-  systemctl restart cve98432 </dev/null
+  chmod 755 "$HELPER"
+  write_unit "$HELPER start" "$HELPER stop"
+  ipt_present
+}
+
+apply_firewalld() {
+  firewall-cmd --permanent --direct --query-rule ipv4 raw PREROUTING 0 "${IPT_ARGS[@]}" >/dev/null 2>&1 || \
+    firewall-cmd --permanent --direct --add-rule ipv4 raw PREROUTING 0 "${IPT_ARGS[@]}" >/dev/null
+  firewall-cmd --reload >/dev/null
+  ipt_present
+}
+
+if [ "$MODE" = "apply" ]; then
+  KMAJ=$(uname -r | cut -d. -f1)
+  # clean previous install of any backend, then choose one
+  remove_all
+  if [ "$KMAJ" -ge 4 ] && ! have nft && have apt-get; then
+    echo "Installing nftables..."
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq </dev/null >/dev/null 2>&1
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables </dev/null >/dev/null 2>&1
+  fi
+
+  BACKEND=none
+  if [ "$KMAJ" -ge 4 ] && have nft && apply_nft; then
+    BACKEND=nft
+  else
+    systemctl disable --now cve98432 </dev/null >/dev/null 2>&1; rm -f "$UNIT" "$RULES"
+    if ! have iptables; then
+      fail "$H: neither working nft nor iptables found"; exit 1
+    fi
+    if fw_active; then
+      apply_firewalld && BACKEND=firewalld
+    else
+      apply_iptables && BACKEND=iptables
+    fi
+  fi
+  [ "$BACKEND" = none ] && { fail "$H: could not install rule (journalctl -u cve98432)"; }
+  echo "$BACKEND" > "$STATE"
 
   if [ -e "$MIG" ]; then
     echo 'net.ipv4.tcp_migrate_req=0' > "$SYSCTL"
@@ -79,15 +160,25 @@ EOF
 fi
 
 # ---------- verify ----------
-echo "== $H | kernel $(uname -r) =="
+BACKEND=$(detect_backend)
+echo "== $H | kernel $(uname -r) | backend $BACKEND =="
 
-systemctl is-enabled cve98432 </dev/null >/dev/null 2>&1 && ok "service enabled (survives reboot)" || fail "service not enabled"
-systemctl is-active  cve98432 </dev/null >/dev/null 2>&1 && ok "service active" || fail "service not active (journalctl -u cve98432)"
+case "$BACKEND" in
+  nft|iptables)
+    systemctl is-enabled cve98432 </dev/null >/dev/null 2>&1 && ok "service enabled (survives reboot)" || fail "service not enabled"
+    systemctl is-active  cve98432 </dev/null >/dev/null 2>&1 && ok "service active" || fail "service not active (journalctl -u cve98432)"
+    ;;
+  firewalld)
+    firewall-cmd --permanent --direct --query-rule ipv4 raw PREROUTING 0 "${IPT_ARGS[@]}" >/dev/null 2>&1 \
+      && ok "firewalld permanent direct rule (survives reboot)" || fail "firewalld permanent rule missing"
+    ;;
+  *) fail "mitigation not installed" ;;
+esac
 
-if nft list chain inet cve98432 pre </dev/null 2>/dev/null | grep -q 'hdrlength != 5'; then
-  ok "nft rule present"
-else
-  fail "nft rule missing"
+if [ "$BACKEND" = nft ]; then
+  nft list chain inet cve98432 pre </dev/null 2>/dev/null | grep -q 'hdrlength != 5' && ok "nft rule present" || fail "nft rule missing"
+elif [ "$BACKEND" != none ]; then
+  ipt_present && ok "iptables raw rule present" || fail "iptables raw rule missing"
 fi
 
 if [ -e "$MIG" ]; then
@@ -97,10 +188,17 @@ else
 fi
 
 # functional test: normal SYN must pass, SYN with IPv4 options must be dropped
-cnt() { nft list chain inet cve98432 pre </dev/null 2>/dev/null | grep -o 'packets [0-9]*' | awk '{print $2}'; }
-if command -v python3 >/dev/null 2>&1; then
+cnt() {
+  if [ "$BACKEND" = nft ]; then
+    nft list chain inet cve98432 pre </dev/null 2>/dev/null | grep -o 'packets [0-9]*' | awk '{print $2; exit}'
+  else
+    iptables -t raw -L -v -n -x 2>/dev/null | awk '/u32/ {print $1; exit}'
+  fi
+}
+PY=$(command -v python3 || command -v python || command -v python2 || true)
+if [ -n "$PY" ] && [ "$BACKEND" != none ]; then
   BEFORE=$(cnt); BEFORE=${BEFORE:-0}
-  RES=$(python3 -c '
+  RES=$("$PY" -c '
 import socket
 srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(8)
 port = srv.getsockname()[1]
@@ -109,12 +207,12 @@ def t(opts):
     if opts:
         s.setsockopt(socket.IPPROTO_IP, 4, b"\x07\x07\x04\x00\x00\x00\x00\x00")  # IP_OPTIONS: Record Route
     try:
-        s.connect(("127.0.0.1", port)); return 1
+        s.connect(("127.0.0.1", port)); r = 1
     except Exception:
-        return 0
-    finally:
-        s.close()
-print(t(False), t(True))
+        r = 0
+    s.close()
+    return r
+print("%d %d" % (t(False), t(True)))
 ' </dev/null 2>/dev/null)
   AFTER=$(cnt); AFTER=${AFTER:-0}
   NORMAL=${RES%% *}; WITHOPT=${RES##* }
@@ -124,8 +222,8 @@ print(t(False), t(True))
   else
     fail "TCP with IPv4 options NOT dropped (connect=$WITHOPT, counter $BEFORE -> $AFTER)"
   fi
-else
-  warn "python3 not found, functional test skipped"
+elif [ -z "$PY" ]; then
+  warn "python not found, functional test skipped"
 fi
 
 if [ $FAILED -eq 0 ]; then
