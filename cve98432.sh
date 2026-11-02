@@ -247,4 +247,27 @@ if [ $FAILED -eq 0 ]; then
 else
   echo "${R}RESULT $H: NOT OK${N}"
 fi
+
+# ---------- system info + official kernel fix status (as of 2026-11-02) ----------
+OS=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}")
+OSID=$(. /etc/os-release 2>/dev/null; echo "${ID:-?}:${VERSION_ID:-?}")
+case "$OSID" in
+  debian:13*)           FIX="available: linux 6.12.113-1 (DSA-6568-1) -> apt update && apt full-upgrade -y && reboot" ;;
+  debian:12*)           FIX="available: linux 6.1.190-1 / linux-6.12 6.12.113-1~deb12u1 -> apt update && apt full-upgrade -y && reboot" ;;
+  debian:11*|debian:10*) FIX="none (Debian LTS ended) -> keep mitigation" ;;
+  ubuntu:2[0-9].04|ubuntu:2[0-9].10)
+    case "${OSID#ubuntu:}" in
+      20.04|18.04|16.04) FIX="none (end of standard support, Pro/ESM only) -> keep mitigation" ;;
+      *)                 FIX="not released yet (Ubuntu: work in progress) -> keep mitigation, check later" ;;
+    esac ;;
+  ubuntu:1[0-9].*)      FIX="none (end of standard support, Pro/ESM only) -> keep mitigation" ;;
+  almalinux:9*)         FIX="testing repo only: kernel-5.14.0-687.61.2.el9_8 (almalinux-testing)" ;;
+  almalinux:8*)         FIX="testing repo only: kernel-4.18.0-553.180.2.el8_10 (almalinux-testing)" ;;
+  almalinux:10*)        FIX="testing repo only: kernel-6.12.0-211.69.2.el10_2 (almalinux-testing)" ;;
+  centos:7*|centos:6*)  FIX="none (CentOS EOL) -> keep mitigation" ;;
+  *)                    FIX="unknown for this OS -> check vendor advisory" ;;
+esac
+echo "OS:         $OS"
+echo "Kernel:     $(uname -r)"
+echo "Kernel fix: $FIX"
 exit $FAILED
