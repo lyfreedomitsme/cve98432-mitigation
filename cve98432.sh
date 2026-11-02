@@ -8,6 +8,7 @@
 #   bash cve98432.sh --remove   # remove mitigation (after kernel is patched)
 set -u
 UNIT=/etc/systemd/system/cve98432.service
+RULES=/etc/cve98432.nft
 SYSCTL=/etc/sysctl.d/99-cve98432.conf
 MIG=/proc/sys/net/ipv4/tcp_migrate_req
 H=$(hostname)
@@ -23,7 +24,7 @@ MODE=${1:-apply}
 # ---------- remove ----------
 if [ "$MODE" = "--remove" ]; then
   systemctl disable --now cve98432 </dev/null >/dev/null 2>&1
-  rm -f "$UNIT" "$SYSCTL"
+  rm -f "$UNIT" "$SYSCTL" "$RULES"
   systemctl daemon-reload </dev/null
   if nft list table inet cve98432 </dev/null >/dev/null 2>&1; then
     fail "$H: table inet cve98432 still present"
@@ -42,6 +43,15 @@ if [ "$MODE" = "apply" ]; then
   fi
   NFT=$(command -v nft) || { fail "$H: nft not available"; exit 1; }
 
+  # rules in a file: avoids CLI parsing issues on old nft (0.9.x treats "-300" as an option)
+  cat > "$RULES" <<'EOF'
+table inet cve98432 {
+  chain pre {
+    type filter hook prerouting priority -300; policy accept;
+    ip protocol tcp ip hdrlength != 5 counter drop
+  }
+}
+EOF
   cat > "$UNIT" <<EOF
 [Unit]
 Description=Mitigation CVE-2026-98432 (drop TCP with IPv4 options)
@@ -52,10 +62,8 @@ Wants=network-pre.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStartPre=-$NFT delete table inet cve98432
-ExecStart=$NFT add table inet cve98432
-ExecStart=$NFT add chain inet cve98432 pre { type filter hook prerouting priority -300 \; policy accept \; }
-ExecStart=$NFT add rule inet cve98432 pre ip protocol tcp ip hdrlength != 5 counter drop
-ExecStop=$NFT delete table inet cve98432
+ExecStart=$NFT -f $RULES
+ExecStop=-$NFT delete table inet cve98432
 
 [Install]
 WantedBy=multi-user.target
