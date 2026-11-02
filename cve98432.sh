@@ -196,8 +196,10 @@ fi
 
 if [ -e "$MPTCP" ]; then
   [ "$(cat $MPTCP)" = "0" ] && ok "mptcp.enabled = 0" || fail "mptcp.enabled = $(cat $MPTCP)"
-  if have ss && [ -n "$(ss -lnMH 2>/dev/null)" ]; then
-    warn "MPTCP listeners still open (opened before disable) — restart their services: ss -lnMp"
+  # only public listeners matter; localhost ones (e.g. containerd: Go >= 1.24 enables MPTCP by default) are not reachable remotely
+  PUB_MPTCP=$(have ss && ss -lnMHp 2>/dev/null | awk '$4 !~ /^(127\.|\[::1\]|::1)/')
+  if [ -n "$PUB_MPTCP" ]; then
+    warn "public MPTCP listeners still open (opened before disable) — restart: $(echo "$PUB_MPTCP" | grep -o '(("[^"]*"' | tr -d '("' | sort -u | tr '\n' ' ')"
   fi
 else
   ok "MPTCP not in this kernel (n/a)"
