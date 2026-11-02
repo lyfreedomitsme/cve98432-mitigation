@@ -5,7 +5,7 @@
 #       backend nft       : nftables table inet cve98432 (systemd unit)
 #       backend iptables  : iptables raw PREROUTING u32 rule (systemd unit)
 #       backend firewalld : same iptables rule as a permanent firewalld direct rule
-#   - net.ipv4.tcp_migrate_req=0 (if the kernel has it)
+#   - net.ipv4.tcp_migrate_req=0 and net.mptcp.enabled=0 (if the kernel has them)
 # Usage:
 #   bash cve98432.sh            # apply + verify
 #   bash cve98432.sh --check    # verify only
@@ -17,6 +17,7 @@ HELPER=/usr/local/sbin/cve98432-iptables
 SYSCTL=/etc/sysctl.d/99-cve98432.conf
 STATE=/etc/cve98432.backend
 MIG=/proc/sys/net/ipv4/tcp_migrate_req
+MPTCP=/proc/sys/net/mptcp/enabled
 U32='0>>24&0x0F=6:15'                       # IPv4 IHL 6..15 = header has options
 IPT_ARGS=(-p tcp -m u32 --u32 "$U32" -j DROP)
 H=$(hostname)
@@ -153,10 +154,16 @@ if [ "$MODE" = "apply" ]; then
   [ "$BACKEND" = none ] && { fail "$H: could not install rule (journalctl -u cve98432)"; }
   echo "$BACKEND" > "$STATE"
 
+  : > "$SYSCTL"
   if [ -e "$MIG" ]; then
-    echo 'net.ipv4.tcp_migrate_req=0' > "$SYSCTL"
+    echo 'net.ipv4.tcp_migrate_req=0' >> "$SYSCTL"
     sysctl -q -w net.ipv4.tcp_migrate_req=0 >/dev/null 2>&1
   fi
+  if [ -e "$MPTCP" ]; then
+    echo 'net.mptcp.enabled=0' >> "$SYSCTL"
+    sysctl -q -w net.mptcp.enabled=0 >/dev/null 2>&1
+  fi
+  [ -s "$SYSCTL" ] || rm -f "$SYSCTL"
 fi
 
 # ---------- verify ----------
@@ -185,6 +192,15 @@ if [ -e "$MIG" ]; then
   [ "$(cat $MIG)" = "0" ] && ok "tcp_migrate_req = 0" || fail "tcp_migrate_req = $(cat $MIG)"
 else
   ok "tcp_migrate_req not in this kernel (n/a)"
+fi
+
+if [ -e "$MPTCP" ]; then
+  [ "$(cat $MPTCP)" = "0" ] && ok "mptcp.enabled = 0" || fail "mptcp.enabled = $(cat $MPTCP)"
+  if have ss && [ -n "$(ss -lnMH 2>/dev/null)" ]; then
+    warn "MPTCP listeners still open (opened before disable) — restart their services: ss -lnMp"
+  fi
+else
+  ok "MPTCP not in this kernel (n/a)"
 fi
 
 # functional test: normal SYN must pass, SYN with IPv4 options must be dropped
