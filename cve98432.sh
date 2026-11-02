@@ -249,11 +249,13 @@ else
 fi
 
 # ---------- system info + official kernel fix status (as of 2026-11-02) ----------
+# upgrades only the installed kernel metapackage(s) (linux-image-amd64 / -cloud-amd64 / -6.12-amd64)
+KERNEL_ONLY_CMD='apt update && apt install -y --only-upgrade $(dpkg-query -W -f='"'"'${db:Status-Abbrev}${Package}\n'"'"' '"'"'linux-image-*'"'"' | awk '"'"'/^ii/{print $2}'"'"' | grep -vE '"'"'^linux-image-[0-9]+\.[0-9]+\.[0-9]+[-+]'"'"') && reboot'
 OS=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}")
 OSID=$(. /etc/os-release 2>/dev/null; echo "${ID:-?}:${VERSION_ID:-?}")
 case "$OSID" in
-  debian:13*)           FIX="available: linux 6.12.113-1 (DSA-6568-1) -> apt update && apt full-upgrade -y && reboot" ;;
-  debian:12*)           FIX="available: linux 6.1.190-1 / linux-6.12 6.12.113-1~deb12u1 -> apt update && apt full-upgrade -y && reboot" ;;
+  debian:13*)           FIX="available: linux 6.12.113-1 (DSA-6568-1)"; KUPD=1 ;;
+  debian:12*)           FIX="available: linux 6.1.190-1 / linux-6.12 6.12.113-1~deb12u1"; KUPD=1 ;;
   debian:11*|debian:10*) FIX="none (Debian LTS ended) -> keep mitigation" ;;
   ubuntu:2[0-9].04|ubuntu:2[0-9].10)
     case "${OSID#ubuntu:}" in
@@ -270,4 +272,8 @@ esac
 echo "OS:         $OS"
 echo "Kernel:     $(uname -r)"
 echo "Kernel fix: $FIX"
+if [ "${KUPD:-0}" = 1 ]; then
+  echo "Kernel-only update (does not touch PHP/DB/etc.), then remove mitigation:"
+  echo "  $KERNEL_ONLY_CMD"
+fi
 exit $FAILED
